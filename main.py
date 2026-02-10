@@ -1,7 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import threading
-import queue
 import pyaudio
 import wave
 import numpy as np
@@ -11,6 +10,8 @@ from pathlib import Path
 import subprocess
 import time
 import warnings
+from fastdtw import fastdtw
+from scipy.spatial.distance import euclidean
 
 warnings.filterwarnings("ignore")
 
@@ -18,17 +19,18 @@ class SoundTriggerApp:
     def __init__(self, root):
         self.root = root
         self.root.title("Sound Trigger v1.0")
-        self.root.geometry("600x500")
+        self.root.geometry("600x650")
         self.root.configure(bg='#2b2b2b')
         
         self.target_audio_path = tk.StringVar()
         self.exe_path = tk.StringVar()
         self.is_listening = False
         self.sound_model = None
-        self.threshold = 0.7
-        self.audio_queue = queue.Queue()
+        self.threshold = 2.5
+        self.min_volume = tk.DoubleVar(value=0.008)
         self.last_trigger_time = 0
-        self.cooldown = 2.0
+        self.cooldown = 1.2
+        self.trigger_count = 0
         
         self.setup_styles()
         self.setup_ui()
@@ -45,7 +47,8 @@ class SoundTriggerApp:
             'secondary': '#3c3c3c',
             'success': '#4CAF50',
             'warning': '#FF9800',
-            'danger': '#F44336'
+            'danger': '#F44336',
+            'trigger': '#FF5252'
         }
         
         self.style.configure('TFrame', background=self.colors['bg'])
@@ -53,6 +56,7 @@ class SoundTriggerApp:
         self.style.configure('TButton', background=self.colors['accent'], foreground=self.colors['fg'])
         self.style.configure('Header.TLabel', font=('Arial', 16, 'bold'))
         self.style.configure('Title.TLabel', font=('Arial', 12, 'bold'))
+        self.style.map('TButton', background=[('active', '#357abd')])
         
     def setup_ui(self):
         header_frame = ttk.Frame(self.root)
@@ -99,30 +103,71 @@ class SoundTriggerApp:
         ttk.Button(app_content, text="Обзор...", 
                   command=self.browse_exe).grid(row=1, column=1)
         
+        settings_frame = ttk.LabelFrame(main_container, text="Настройки")
+        settings_frame.pack(fill='x', pady=(0, 15))
+        
+        settings_content = ttk.Frame(settings_frame)
+        settings_content.pack(padx=10, pady=10)
+        
+        ttk.Label(settings_content, text="Минимальная громкость:").grid(row=0, column=0, sticky='w', pady=5)
+        volume_scale = ttk.Scale(settings_content, from_=0.001, to=0.05, 
+                                variable=self.min_volume, orient='horizontal',
+                                command=self.update_volume_label)
+        volume_scale.grid(row=0, column=1, padx=(10, 0), sticky='ew')
+        settings_content.columnconfigure(1, weight=1)
+        
+        self.volume_label = ttk.Label(settings_content, text=f"Значение: {self.min_volume.get():.3f}")
+        self.volume_label.grid(row=0, column=2, padx=(10, 0))
+        
         control_frame = ttk.Frame(main_container)
         control_frame.pack(fill='x', pady=20)
         
         self.status_label = ttk.Label(control_frame, text="Статус: Остановлен", 
-                                     foreground=self.colors['warning'])
+                                     foreground=self.colors['warning'], font=('Arial', 11, 'bold'))
         self.status_label.pack(pady=(0, 10))
         
         self.listen_btn = ttk.Button(control_frame, text="Начать прослушивание", 
-                                    command=self.toggle_listening, width=20)
+                                    command=self.toggle_listening, width=25)
         self.listen_btn.pack()
         
-        threshold_frame = ttk.LabelFrame(main_container, text="Чувствительность распознавания")
+        threshold_frame = ttk.LabelFrame(main_container, text="Порог различия")
         threshold_frame.pack(fill='x', pady=(0, 15))
         
         threshold_content = ttk.Frame(threshold_frame)
         threshold_content.pack(padx=10, pady=10)
         
-        self.threshold_scale = ttk.Scale(threshold_content, from_=0.1, to=1.0, 
+        self.threshold_scale = ttk.Scale(threshold_content, from_=50, to=500, 
                                         value=self.threshold, orient='horizontal',
                                         command=self.update_threshold_label)
         self.threshold_scale.pack(fill='x')
         
         self.threshold_label = ttk.Label(threshold_content, text=f"Текущее значение: {self.threshold:.2f}")
-        self.threshold_label.pack()
+        self.threshold_label.pack(pady=(5, 0))
+        
+        ttk.Label(threshold_content, text="(БОЛЬШЕ значение = выше чувствительность)", 
+                 foreground='#FF5252', font=('Arial', 9, 'bold')).pack()
+        
+        test_frame = ttk.LabelFrame(main_container, text="Тестирование")
+        test_frame.pack(fill='x', pady=(0, 15))
+        
+        test_content = ttk.Frame(test_frame)
+        test_content.pack(padx=10, pady=10)
+        
+        ttk.Button(test_content, text="Проверить текущий звук", 
+                  command=self.test_current_sound, width=25).pack(pady=(0, 5))
+        
+        self.test_result = ttk.Label(test_content, text="", foreground='#aaaaaa', font=('Arial', 10))
+        self.test_result.pack(pady=(5, 0))
+        
+        stats_frame = ttk.LabelFrame(main_container, text="Статистика")
+        stats_frame.pack(fill='x', pady=(0, 15))
+        
+        stats_content = ttk.Frame(stats_frame)
+        stats_content.pack(padx=10, pady=10)
+        
+        self.trigger_count_label = ttk.Label(stats_content, text="Срабатываний: 0", 
+                                           foreground=self.colors['accent'])
+        self.trigger_count_label.pack()
         
         info_frame = ttk.Frame(main_container)
         info_frame.pack(fill='x', pady=10)
@@ -131,11 +176,18 @@ class SoundTriggerApp:
                                    foreground='#aaaaaa', wraplength=500)
         self.info_label.pack()
         
+        hint_frame = ttk.Frame(self.root)
+        hint_frame.pack(fill='x', padx=30, pady=(0, 15))
+        
+        hint_label = ttk.Label(hint_frame, text="💡 Совет: Используйте короткий четкий звук (хлопок, щелчок). Для слабых звуков увеличьте порог до 2.5-3.5", 
+                              foreground='#777777', font=('Arial', 9))
+        hint_label.pack()
+        
     def setup_audio(self):
-        self.CHUNK = 2048
+        self.CHUNK = 1024
         self.FORMAT = pyaudio.paInt16
         self.CHANNELS = 1
-        self.RATE = 44100
+        self.RATE = 16000
         self.RECORD_SECONDS = 2
         
     def browse_audio(self):
@@ -154,171 +206,305 @@ class SoundTriggerApp:
     def update_threshold_label(self, value):
         self.threshold = float(value)
         self.threshold_label.config(text=f"Текущее значение: {self.threshold:.2f}")
+    
+    def update_volume_label(self, value):
+        self.volume_label.config(text=f"Значение: {float(value):.3f}")
             
     def record_sound(self):
         def record():
-            p = pyaudio.PyAudio()
-            
-            stream = p.open(format=self.FORMAT,
-                          channels=self.CHANNELS,
-                          rate=self.RATE,
-                          input=True,
-                          frames_per_buffer=self.CHUNK)
-            
-            messagebox.showinfo("Запись", "Говорите сейчас! Запись начнется через 3 секунды...")
-            self.root.after(3000, lambda: self.start_recording(p, stream))
-            
+            try:
+                p = pyaudio.PyAudio()
+                
+                stream = p.open(format=self.FORMAT,
+                              channels=self.CHANNELS,
+                              rate=self.RATE,
+                              input=True,
+                              frames_per_buffer=self.CHUNK)
+                
+                self.root.after(0, lambda: messagebox.showinfo("Запись", "Запись начнется через 2 секунды.\nИздайте четкий звук (хлопок, щелчок пальцами)!"))
+                time.sleep(2.5)
+                
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Запись звука...", foreground=self.colors['warning']))
+                
+                frames = []
+                total_chunks = int(self.RATE / self.CHUNK * self.RECORD_SECONDS)
+                
+                for i in range(total_chunks):
+                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                    frames.append(data)
+                
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+                
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Статус: Остановлен", foreground=self.colors['warning']))
+                
+                filename = filedialog.asksaveasfilename(defaultextension=".wav",
+                                                   filetypes=[("WAV файлы", "*.wav")],
+                                                   initialfile="trigger_sound.wav")
+                if filename:
+                    wf = wave.open(filename, 'wb')
+                    wf.setnchannels(self.CHANNELS)
+                    wf.setsampwidth(p.get_sample_size(self.FORMAT))
+                    wf.setframerate(self.RATE)
+                    wf.writeframes(b''.join(frames))
+                    wf.close()
+                    
+                    self.root.after(0, lambda: self.target_audio_path.set(filename))
+                    self.root.after(0, self.train_model)
+                    
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Ошибка записи: {str(e)}"))
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Статус: Остановлен", foreground=self.colors['warning']))
+        
+        self.is_listening = False
         threading.Thread(target=record, daemon=True).start()
         
-    def start_recording(self, p, stream):
-        frames = []
+    def test_current_sound(self):
+        if self.sound_model is None:
+            messagebox.showwarning("Внимание", "Сначала загрузите звук-триггер!")
+            return
+            
+        def record_test():
+            try:
+                p = pyaudio.PyAudio()
+                
+                stream = p.open(format=self.FORMAT,
+                              channels=self.CHANNELS,
+                              rate=self.RATE,
+                              input=True,
+                              frames_per_buffer=self.CHUNK)
+                
+                self.root.after(0, lambda: messagebox.showinfo("Тест", "Издайте звук для теста (2 секунды)..."))
+                time.sleep(0.5)
+                
+                frames = []
+                for _ in range(0, int(self.RATE / self.CHUNK * 2)):
+                    data = stream.read(self.CHUNK, exception_on_overflow=False)
+                    frames.append(data)
+                
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+                
+                test_audio = b''.join(frames)
+                distance = self.compare_audio(test_audio, is_test=True)
+                
+                self.root.after(0, lambda: self.test_result.config(
+                    text=f"Расстояние: {distance:.2f} (порог: {self.threshold:.2f})"))
+                
+                if distance < self.threshold:
+                    self.root.after(0, lambda: self.test_result.config(foreground=self.colors['success']))
+                    self.root.after(0, lambda: self.info_label.config(
+                        text="✅ Звук распознан! Попробуйте в реальном режиме прослушивания.", 
+                        foreground=self.colors['success']))
+                else:
+                    self.root.after(0, lambda: self.test_result.config(foreground=self.colors['warning']))
+                    self.root.after(0, lambda: self.info_label.config(
+                        text=f"❌ Звук не распознан. Расстояние {distance:.2f} > порога {self.threshold:.2f}. Увеличьте порог или запишите более четкий звук.", 
+                        foreground=self.colors['warning']))
+                    
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Ошибка", f"Ошибка теста: {str(e)}"))
         
-        for _ in range(0, int(self.RATE / self.CHUNK * self.RECORD_SECONDS)):
-            data = stream.read(self.CHUNK)
-            frames.append(data)
+        threading.Thread(target=record_test, daemon=True).start()
+    
+    def has_sufficient_volume(self, audio_data):
+        audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
         
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
+        if len(audio_array) == 0:
+            return False
+            
+        rms = np.sqrt(np.mean(audio_array**2))
+        max_possible = 32767.0
+        normalized_volume = rms / max_possible
         
-        filename = filedialog.asksaveasfilename(defaultextension=".wav",
-                                               filetypes=[("WAV файлы", "*.wav")])
-        if filename:
-            wf = wave.open(filename, 'wb')
-            wf.setnchannels(self.CHANNELS)
-            wf.setsampwidth(p.get_sample_size(self.FORMAT))
-            wf.setframerate(self.RATE)
-            wf.writeframes(b''.join(frames))
-            wf.close()
-            
-            self.target_audio_path.set(filename)
-            self.train_model()
-            
-    def extract_features(self, audio_path):
-        try:
-            y, sr = librosa.load(audio_path, sr=self.RATE)
-            
-            if len(y) < self.CHUNK:
-                y = np.pad(y, (0, self.CHUNK - len(y)), mode='constant')
-            
-            n_fft = min(2048, len(y))
-            
-            mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13, n_fft=n_fft, hop_length=n_fft//4)
-            mfcc_mean = np.mean(mfcc.T, axis=0)
-            
-            features = mfcc_mean
-            
-            return features, sr
-        except Exception as e:
-            print(f"Ошибка при извлечении признаков: {e}")
-            return None, None
+        return normalized_volume > self.min_volume.get()
+    
+    def extract_mfcc(self, y):
+        y = librosa.util.normalize(y)
+        
+        n_fft = 512
+        hop_length = 256
+        
+        mfcc = librosa.feature.mfcc(
+            y=y, 
+            sr=self.RATE, 
+            n_mfcc=13,
+            n_fft=n_fft,
+            hop_length=hop_length
+        )
+        
+        mfcc_delta = librosa.feature.delta(mfcc)
+        mfcc_delta2 = librosa.feature.delta(mfcc, order=2)
+        
+        features = np.vstack([mfcc, mfcc_delta, mfcc_delta2])
+        
+        return features.T
             
     def train_model(self):
         if not self.target_audio_path.get():
             return
             
         try:
-            self.info_label.config(text="Обучение модели...")
+            self.info_label.config(text="Обучение модели...", foreground='#aaaaaa')
             self.root.update()
             
-            features, sr = self.extract_features(self.target_audio_path.get())
-            if features is not None:
-                self.sound_model = {
-                    'features': features,
-                    'sr': sr,
-                    'path': self.target_audio_path.get()
-                }
-                self.info_label.config(text=f"Модель обучена: {Path(self.target_audio_path.get()).name}")
-            else:
-                self.info_label.config(text="Ошибка при обучении модели")
+            y, sr = librosa.load(self.target_audio_path.get(), sr=self.RATE)
+            
+            if len(y) < self.RATE * 0.3:
+                self.info_label.config(text="Звук слишком короткий (минимум 0.3 сек)", foreground=self.colors['warning'])
+                return
+            
+            mfcc_features = self.extract_mfcc(y)
+            
+            self.sound_model = {
+                'mfcc': mfcc_features,
+                'path': self.target_audio_path.get(),
+                'length': len(y) / self.RATE
+            }
+            
+            self.info_label.config(
+                text=f"Модель обучена: {Path(self.target_audio_path.get()).name}\nДлительность: {self.sound_model['length']:.2f} сек, Фреймов: {self.sound_model['mfcc'].shape[0]}", 
+                foreground=self.colors['success'])
                 
         except Exception as e:
-            messagebox.showerror("Ошибка", f"Не удалось обработать аудиофайл: {e}")
+            messagebox.showerror("Ошибка", f"Не удалось обработать аудиофайл:\n{str(e)}")
+            self.info_label.config(text="Ошибка при обучении модели", foreground=self.colors['danger'])
             
-    def compare_audio(self, audio_data):
+    def compare_audio(self, audio_data, is_test=False):
         if self.sound_model is None:
-            return 0
+            return float('inf')
             
         try:
-            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32)
+            if not self.has_sufficient_volume(audio_data):
+                return float('inf')
             
-            if len(audio_array) < self.CHUNK:
-                audio_array = np.pad(audio_array, (0, self.CHUNK - len(audio_array)), mode='constant')
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
             
-            n_fft = min(2048, len(audio_array))
+            if len(audio_array) < self.RATE * 0.4:
+                return float('inf')
             
-            mfcc_current = librosa.feature.mfcc(y=audio_array, sr=self.RATE, n_mfcc=13, 
-                                               n_fft=n_fft, hop_length=n_fft//4)
-            mfcc_mean_current = np.mean(mfcc_current.T, axis=0)
+            current_mfcc = self.extract_mfcc(audio_array)
+            ref_mfcc = self.sound_model['mfcc']
             
-            if len(mfcc_mean_current) != len(self.sound_model['features']):
-                min_len = min(len(mfcc_mean_current), len(self.sound_model['features']))
-                similarity = np.dot(mfcc_mean_current[:min_len], self.sound_model['features'][:min_len])
-                similarity /= (np.linalg.norm(mfcc_mean_current[:min_len]) * 
-                              np.linalg.norm(self.sound_model['features'][:min_len]) + 1e-10)
-            else:
-                similarity = np.dot(mfcc_mean_current, self.sound_model['features'])
-                similarity /= (np.linalg.norm(mfcc_mean_current) * 
-                              np.linalg.norm(self.sound_model['features']) + 1e-10)
+            if current_mfcc.shape[0] < 8 or ref_mfcc.shape[0] < 8:
+                return float('inf')
             
-            return abs(similarity)
-        except Exception as e:
-            print(f"Ошибка сравнения: {e}")
-            return 0
+            distance, _ = fastdtw(current_mfcc, ref_mfcc, dist=euclidean)
+            normalized_distance = distance / ref_mfcc.shape[0]
+            
+            return normalized_distance
+                
+        except Exception:
+            return float('inf')
             
     def listen_audio(self):
-        p = pyaudio.PyAudio()
-        
-        stream = p.open(format=self.FORMAT,
-                       channels=self.CHANNELS,
-                       rate=self.RATE,
-                       input=True,
-                       frames_per_buffer=self.CHUNK)
-        
-        self.status_label.config(text="Статус: Прослушивание...", foreground=self.colors['success'])
-        
-        buffer = []
-        buffer_size = int(self.RATE / self.CHUNK * 0.5)
-        
-        while self.is_listening:
-            try:
-                audio_data = stream.read(self.CHUNK, exception_on_overflow=False)
-                
-                buffer.append(audio_data)
-                if len(buffer) > buffer_size:
-                    buffer.pop(0)
-                
-                if len(buffer) == buffer_size:
-                    combined_audio = b''.join(buffer)
-                    similarity = self.compare_audio(combined_audio)
+        try:
+            p = pyaudio.PyAudio()
+            
+            stream = p.open(format=self.FORMAT,
+                           channels=self.CHANNELS,
+                           rate=self.RATE,
+                           input=True,
+                           frames_per_buffer=self.CHUNK)
+            
+            self.root.after(0, lambda: self.status_label.config(
+                text="Статус: Прослушивание...", foreground=self.colors['success']))
+            
+            buffer = []
+            buffer_duration = 1.2
+            buffer_size = int(self.RATE / self.CHUNK * buffer_duration)
+            
+            while self.is_listening:
+                try:
+                    audio_data = stream.read(self.CHUNK, exception_on_overflow=False)
                     
-                    current_time = time.time()
-                    if similarity > self.threshold and (current_time - self.last_trigger_time) > self.cooldown:
-                        print(f"Обнаружен звук! Сходство: {similarity:.2f}")
-                        self.last_trigger_time = current_time
-                        self.root.after(0, self.trigger_action)
+                    buffer.append(audio_data)
+                    if len(buffer) > buffer_size:
+                        buffer.pop(0)
+                    
+                    if len(buffer) == buffer_size:
+                        combined_audio = b''.join(buffer)
                         
-            except Exception as e:
-                print(f"Ошибка при прослушивании: {e}")
-                break
-                
-        stream.stop_stream()
-        stream.close()
-        p.terminate()
-        
-    def trigger_action(self):
-        if self.exe_path.get():
+                        if not self.has_sufficient_volume(combined_audio):
+                            continue
+                        
+                        distance = self.compare_audio(combined_audio)
+                        
+                        current_time = time.time()
+                        if distance < self.threshold and (current_time - self.last_trigger_time) > self.cooldown:
+                            self.last_trigger_time = current_time
+                            self.trigger_count += 1
+                            self.root.after(0, lambda d=distance: self.trigger_action(d))
+                            self.root.after(0, self.visual_feedback)
+                            
+                except Exception:
+                    if self.is_listening:
+                        continue
+                    else:
+                        break
+                        
+        except Exception:
+            pass
+        finally:
             try:
-                self.info_label.config(text="Запуск приложения...", foreground=self.colors['success'])
-                subprocess.Popen(self.exe_path.get())
+                stream.stop_stream()
+                stream.close()
+                p.terminate()
+            except:
+                pass
+            
+            if not self.is_listening:
+                self.root.after(0, lambda: self.status_label.config(
+                    text="Статус: Остановлен", foreground=self.colors['warning']))
+    
+    def visual_feedback(self):
+        original_bg = self.root.cget('bg')
+        self.root.configure(bg=self.colors['trigger'])
+        self.status_label.config(text="✅ СИГНАЛ ОБНАРУЖЕН!", foreground=self.colors['success'])
+        self.trigger_count_label.config(text=f"Срабатываний: {self.trigger_count}")
+        
+        def restore():
+            self.root.configure(bg=original_bg)
+            if self.is_listening:
+                self.status_label.config(text="Статус: Прослушивание...", foreground=self.colors['success'])
+        
+        self.root.after(400, restore)
+            
+    def trigger_action(self, distance):
+        exe_path = self.exe_path.get().strip()
+        if not exe_path:
+            self.info_label.config(text="Ошибка: не указан путь к приложению", foreground=self.colors['danger'])
+            return
+            
+        try:
+            if not os.path.exists(exe_path):
+                self.info_label.config(text=f"Ошибка: файл не найден:\n{exe_path}", foreground=self.colors['danger'])
+                return
                 
-                self.root.after(2000, lambda: self.info_label.config(
-                    text=f"Приложение запущено!",
-                    foreground='#aaaaaa'
-                ))
-            except Exception as e:
-                messagebox.showerror("Ошибка", f"Не удалось запустить приложение: {e}")
-                self.info_label.config(text="Ошибка запуска приложения", foreground=self.colors['danger'])
+            self.info_label.config(text=f"Запуск приложения... (расстояние: {distance:.2f})", foreground=self.colors['success'])
+            
+            try:
+                subprocess.Popen([exe_path], shell=True)
+            except Exception as e1:
+                try:
+                    subprocess.Popen(exe_path, shell=True)
+                except Exception as e2:
+                    raise Exception(f"{str(e1)} / {str(e2)}")
+            
+            self.root.after(2500, lambda: self.info_label.config(
+                text=f"✅ Приложение запущено успешно!", 
+                foreground=self.colors['success']))
+                
+        except Exception as e:
+            error_msg = f"Ошибка запуска:\n{str(e)[:80]}"
+            self.info_label.config(text=error_msg, foreground=self.colors['danger'])
+            self.root.after(3000, lambda: self.info_label.config(
+                text="Попробуйте выбрать другой EXE файл", foreground='#aaaaaa'))
                 
     def toggle_listening(self):
         if not self.target_audio_path.get():
@@ -336,20 +522,26 @@ class SoundTriggerApp:
         self.is_listening = not self.is_listening
         
         if self.is_listening:
-            self.listen_btn.config(text="Остановить прослушивание")
+            self.listen_btn.config(text="⏹ Остановить прослушивание")
             self.listen_thread = threading.Thread(target=self.listen_audio, daemon=True)
             self.listen_thread.start()
         else:
-            self.listen_btn.config(text="Начать прослушивание")
+            self.listen_btn.config(text="▶ Начать прослушивание")
             self.status_label.config(text="Статус: Остановлен", foreground=self.colors['warning'])
 
 def main():
     try:
         import pyaudio
         import librosa
+        from fastdtw import fastdtw
     except ImportError as e:
-        print("Установите необходимые библиотеки:")
-        print("pip install pyaudio librosa numpy")
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror("Ошибка", 
+            "Не установлены необходимые библиотеки:\n\n"
+            "Установите командой:\n"
+            "pip install pyaudio librosa numpy fastdtw scipy\n\n"
+            f"Ошибка: {str(e)}")
         return
         
     root = tk.Tk()
